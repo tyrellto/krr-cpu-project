@@ -230,13 +230,14 @@ bool cholesky_inplace(Matrix &M) {
 
         // Update the k-th column (below the diagonal).
         // #pragma omp parallel for schedule(static)
+        #pragma omp simd
         for (int i = k + 1; i < n; i++) {
             M(i, k) /= M(k, k);
         }
 
         // Update the remaining submatrix.
         // Each column j (from k+1 to n-1) can be updated independently.
-        // #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static)
         for (int j = k + 1; j < n; j++) {
             for (int i = j; i < n; i++) {
                 M(i, j) -= M(i, k) * M(j, k);
@@ -245,7 +246,7 @@ bool cholesky_inplace(Matrix &M) {
     }
 
     // Set the upper-triangular part to zero.
-    // #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static)
     for (int r = 0; r < n; r++) {
         for (int c = r + 1; c < n; c++) {
             M(r, c) = 0.0;
@@ -865,44 +866,251 @@ Vector gscFalkon(const Matrix &Kxm,
     return alpha;
 }
 
+// std::pair<Vector, Vector> primalandHaufeLinearWeights(const int n, 
+//                                                       const int d, 
+//                                                       const Vector &alpha, 
+//                                                       const std::vector<std::vector<double>> &X) 
+// {
+//     Vector w(d);
+//     Vector p(d);
+//     Matrix Cov(d, d);
+
+//     for (int j = 0; j < d; j++){
+//         double sum_j = 0.0;
+//         for (int i = 0; i < n; i++){
+//             sum_j += alpha[i] * X[i][j];
+//             // std::cout << alpha[i] << "alpha\n";
+//             // std::cout << X[i][j] << "X\n";
+//         }
+//         w[j] = sum_j;
+//     }
+
+//     for(int r = 0; r < d; r++){
+//         for(int c = 0; c < d; c++){
+//             double sum_rc = 0.0;
+//             for(int i = 0; i < n; i++){
+//                 sum_rc += X[i][r] * X[i][c];
+//             }
+//             Cov(r, c) = sum_rc / double(n);
+//         }
+//     }
+
+//     for(int r = 0; r < d; r++){
+//         double sum_r = 0.0;
+//         for(int c = 0; c < d; c++){
+//             sum_r += Cov(r, c) * w[c];
+//         }
+//         p[r] = sum_r;
+//     }
+//     return {w, p};
+// }
+
+// std::pair<Vector, Vector> primalandHaufeLinearWeights(const int n, 
+//                                                       const int d, 
+//                                                       const Vector &alpha, 
+//                                                       const Matrix &X) 
+// {
+//     Vector w(d);
+//     Vector p(d);
+//     Matrix Cov(d, d);
+
+//     // Compute w: for each feature j, sum over samples i.
+//     #pragma omp parallel for schedule(static)
+//     for (int j = 0; j < d; j++){
+//         double sum_j = 0.0;
+//         #pragma omp simd reduction(+:sum_j)
+//         for (int i = 0; i < n; i++){
+//             sum_j += alpha[i] * X(i, j);
+//         }
+//         w[j] = sum_j;
+//     }
+
+//     // Compute covariance: Cov(r, c) = (1/n) * sum_{i=0}^{n-1} X(i, r) * X(i, c)
+//     #pragma omp parallel for collapse(2) schedule(static)
+//     for (int r = 0; r < d; r++){
+//         for (int c = 0; c < d; c++){
+//             double sum_rc = 0.0;
+//             #pragma omp simd reduction(+:sum_rc)
+//             for (int i = 0; i < n; i++){
+//                 sum_rc += X(i, r) * X(i, c);
+//             }
+//             Cov(r, c) = sum_rc / double(n);
+//         }
+//     }
+
+//     // Compute p: for each feature r, p[r] = sum_{c=0}^{d-1} Cov(r, c) * w[c]
+//     #pragma omp parallel for schedule(static)
+//     for (int r = 0; r < d; r++){
+//         double sum_r = 0.0;
+//         #pragma omp simd reduction(+:sum_r)
+//         for (int c = 0; c < d; c++){
+//             sum_r += Cov(r, c) * w[c];
+//         }
+//         p[r] = sum_r;
+//     }
+    
+//     return {w, p};
+// }
+// Computes the weighted sum vector and the covariance matrix times that vector,
+// then returns the pair {w, p}, where:
+//   w = sum_i (alpha[i] * X(i, :))
+//   Cov = (1/n) * sum_i X(i, :)^T * X(i, :)
+//   p = Cov * w
 std::pair<Vector, Vector> primalandHaufeLinearWeights(const int n, 
                                                       const int d, 
                                                       const Vector &alpha, 
-                                                      const std::vector<std::vector<double>> &X) 
+                                                      const Matrix &X) 
 {
+    // Allocate output vector and matrix.
     Vector w(d);
-    Vector p(d);
     Matrix Cov(d, d);
+    
+    // We'll accumulate w and Cov by iterating over samples (rows) because
+    // each row X(i,:) is stored contiguously.
+    // Create thread–local accumulators to reduce contention.
+    int numThreads = omp_get_max_threads();
+    // std::vector<std::vector<double>> w_local(numThreads, std::vector<double>(d, 0.0));
+    Matrix w_local(numThreads, d);  // each row will correspond to one thread's accumulator
+    std::vector<Matrix> Cov_local(numThreads, Matrix(d, d)); // each thread gets its own dxd matrix.
 
-    for (int j = 0; j < d; j++){
-        double sum_j = 0.0;
-        for (int i = 0; i < n; i++){
-            sum_j += alpha[i] * X[i][j];
-            // std::cout << alpha[i] << "alpha\n";
-            // std::cout << X[i][j] << "X\n";
+    #pragma omp parallel for schedule(static) //num_threads(26)
+    for (int i = 0; i < n; i++){
+        int tid = omp_get_thread_num();
+        // For sample i, X(i,:) is stored contiguously.
+        // Accumulate contribution to w: w_local[tid][j] += alpha[i] * X(i, j)
+        double a = alpha[i];
+        for (int j = 0; j < d; j++){
+            w_local(tid, j) += a * X(i, j);
         }
-        w[j] = sum_j;
-    }
-
-    for(int r = 0; r < d; r++){
-        for(int c = 0; c < d; c++){
-            double sum_rc = 0.0;
-            for(int i = 0; i < n; i++){
-                sum_rc += X[i][r] * X[i][c];
+        // Accumulate contribution to covariance matrix:
+        // For each pair (r, c), add X(i, r)*X(i, c)
+        for (int r = 0; r < d; r++){
+            double X_ir = X(i, r);
+            for (int c = 0; c < d; c++){
+                Cov_local[tid](r, c) += X_ir * X(i, c);
             }
-            Cov(r, c) = sum_rc / double(n);
         }
     }
 
-    for(int r = 0; r < d; r++){
-        double sum_r = 0.0;
-        for(int c = 0; c < d; c++){
-            sum_r += Cov(r, c) * w[c];
+    // Reduce thread–local accumulators into global w and Cov.
+    for (int tid = 0; tid < numThreads; tid++){
+        for (int j = 0; j < d; j++){
+            w[j] += w_local(tid, j);
         }
-        p[r] = sum_r;
+        for (int r = 0; r < d; r++){
+            for (int c = 0; c < d; c++){
+                Cov(r, c) += Cov_local[tid](r, c);
+            }
+        }
     }
+    
+    // Scale Cov by 1/n.
+    for (int r = 0; r < d; r++){
+        for (int c = 0; c < d; c++){
+            Cov(r, c) /= double(n);
+        }
+    }
+    
+    // Now compute p = Cov * w.
+    Vector p(d);
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < d; r++){
+        double sum = 0.0;
+        for (int c = 0; c < d; c++){
+            sum += Cov(r, c) * w[c];
+        }
+        p[r] = sum;
+    }
+    
     return {w, p};
 }
+
+// Assume Matrix and Vector are defined as before, with Matrix storing data contiguously.
+// Not ideal
+// std::pair<Vector, Vector> primalandHaufeLinearWeights(const int n, 
+//                                                       const int d, 
+//                                                       const Vector &alpha, 
+//                                                       const Matrix &X) 
+// {
+//     // Ensure that the dimensions passed match the dimensions in X.
+//     assert(n == X.rows && "n must equal X.rows");
+//     assert(d == X.cols && "d must equal X.cols");
+    
+//     Vector w(d);
+//     Matrix Cov(d, d);
+    
+//     // First, compute w = sum_{i=0}^{n-1} alpha[i] * X(i, :)
+//     #pragma omp parallel for schedule(static)
+//     for (int j = 0; j < d; j++){
+//         double sum_j = 0.0;
+//         for (int i = 0; i < n; i++){
+//             sum_j += alpha[i] * X(i, j);
+//         }
+//         w[j] = sum_j;
+//     }
+//     std::cout << "w calculated.\n";
+//     std::cout << "Cov: " << Cov.rows << " x " << Cov.cols << "\n";
+
+//     // Process the n samples in blocks to accumulate the covariance matrix.
+//     int blockSize = 256;  // Adjust this value as needed.
+    
+//     // Zero the global covariance matrix.
+//     for (int r = 0; r < d; r++){
+//         for (int c = 0; c < d; c++){
+//             Cov(r, c) = 0.0;
+//         }
+//     }
+
+//     std::cout << "cov calculated.\n";
+//     // Process samples in blocks.
+//     for (int b = 0; b < n; b += blockSize) {
+//         int blockEnd = std::min(n, b + blockSize);
+//         Matrix Cov_block(d, d);  // temporary block accumulator (zero-initialized)
+        
+//         // For each sample in the block, accumulate X(i,:) * X(i,:)^T into Cov_block.
+//         #pragma omp parallel for schedule(static)
+//         for (int i = b; i < blockEnd; i++){
+//             for (int r = 0; r < d; r++){
+//                 double X_ir = X(i, r);
+//                 for (int c = 0; c < d; c++){
+//                     double prod = X_ir * X(i, c);
+//                     // Use an atomic update to ensure thread-safety.
+//                     #pragma omp atomic
+//                     Cov_block(r, c) += prod;
+//                 }
+//             }
+//         }
+        
+//         // Accumulate the block's covariance into the global covariance matrix.
+//         for (int r = 0; r < d; r++){
+//             for (int c = 0; c < d; c++){
+//                 Cov(r, c) += Cov_block(r, c);
+//             }
+//         }
+//     }
+    
+//     // Scale Cov by 1/n.
+//     for (int r = 0; r < d; r++){
+//         for (int c = 0; c < d; c++){
+//             Cov(r, c) /= double(n);
+//         }
+//     }
+    
+//     // Compute p = Cov * w.
+//     Vector p(d);
+//     #pragma omp parallel for schedule(static)
+//     for (int r = 0; r < d; r++){
+//         double sum = 0.0;
+//         for (int c = 0; c < d; c++){
+//             sum += Cov(r, c) * w[c];
+//         }
+//         p[r] = sum;
+//     }
+    
+//     return {w, p};
+// }
+
+
 // std::pair<Vector, Vector> primalandHaufeLinearWeights(const int n, 
 //                                                       const int d, 
 //                                                       const Vector &alpha, 
@@ -1065,7 +1273,7 @@ int main() {
     // Matrix Kxm = computeKernelMatrix(X, Xm, gamma);  // n x m
 
     Matrix X(0, 0);
-    if (!loadGaussianData("gaussian_data.bin", X)) {
+    if (!loadGaussianData("gaussian_data_alt.bin", X)) {
         return 1;
     }
     
@@ -1105,17 +1313,21 @@ int main() {
     Matrix Kmm = computeKernelMatrixBlocked(Xm, Xm, gamma, blockSize);
     Matrix Kxm = computeKernelMatrixBlocked(X, Xm, gamma, blockSize);
 
+    std::cout << "Kmm/Kxm solved\n";
+
     double lambda = 5e-1;
     double mu0 = 1e-1;
     double q = 0.5;
     int maxNewtonIters = 50;
-    int cgIters = 20;
+    int cgIters = 50;
 
     int n = nSamples;
     int d = nFeatures;  // nFeatures was loaded earlier
-
+    Vector yv = Vector(y);
+    Vector yvm = Vector(ym);
+    
     auto alpha = gscFalkon(Kxm, Kmm,
-                           Vector(y), Vector(ym),
+                           yv, yvm,
                            lambda, n, cgIters,
                            mu0, q, maxNewtonIters,
                            logistic_second_deriv);
@@ -1126,7 +1338,7 @@ int main() {
     // }
     // std::cout << "\n";
 
-    // auto [primalLinearWeights, haufeLinearWeights] = primalandHaufeLinearWeights(n, d, alpha, X);
+    auto [primalLinearWeights, haufeLinearWeights] = primalandHaufeLinearWeights(n, d, alpha, X);
 
     // std::cout << "Final primal linear weights:\n";
     // for(int i = 0; i < m; i++){
@@ -1134,11 +1346,11 @@ int main() {
     // }
     // std::cout << "\n";
 
-    // std::cout << "Final Haufe linear weights:\n";
-    // for(int i = 0; i < m; i++){
-    //     std::cout << haufeLinearWeights[i] << " ";
-    // }
-    // std::cout << "\n";
+    std::cout << "Final Haufe linear weights:\n";
+    for(int i = 0; i < m; i++){
+        std::cout << haufeLinearWeights[i] << " ";
+    }
+    std::cout << "\n";
 
     return 0;
 }

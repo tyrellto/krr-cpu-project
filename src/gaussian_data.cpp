@@ -7,7 +7,7 @@
 int main() {
     // Dimensions
     const size_t nSamples = 5000;
-    const size_t nFeatures = 70000;
+    const size_t nFeatures = 7000;
     const size_t totalElements = nSamples * nFeatures;
 
     // Allocate contiguous memory for the dataset
@@ -52,7 +52,7 @@ int main() {
     // Save the data to a binary file.
     // The file will first contain nSamples and nFeatures (as size_t values)
     // followed by the data array.
-    std::ofstream outfile("gaussian_data.bin", std::ios::binary);
+    std::ofstream outfile("gaussian_data_alt.bin", std::ios::binary);
     if (!outfile) {
         std::cerr << "Error opening file for writing!" << std::endl;
         return 1;
