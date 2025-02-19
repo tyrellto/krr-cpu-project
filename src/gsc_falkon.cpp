@@ -15,7 +15,7 @@ using namespace std;
 struct Vector {
     std::vector<double> data;
     int size;
-
+    Vector() : size(0) {}
     Vector(int n) : data(n, 0.0), size(n) {}
     Vector(const std::vector<double>& v) : data(v), size((int)v.size()) {}
 
@@ -45,28 +45,7 @@ Vector matVec(const Matrix &M, const Vector &v) {
     }
     return out;
 }
-// Vector matVec(const Matrix &M, const Vector &v) {
-//     assert(M.cols == v.size);
-//     Vector out(M.rows);
-//     #pragma omp parallel for schedule(static)
-//     for (int i = 0; i < M.rows; i++){
-//         double sum = 0.0;
-//         for (int j = 0; j < M.cols; j++){
-//             sum += M(i, j) * v[j];
-//         }
-//         out[i] = sum;
-//     }
-//     return out;
-// }
 
-// double dot(const Vector &a, const Vector &b) {
-//     assert(a.size == b.size);
-//     double sum = 0.0;
-//     for(int i = 0; i < a.size; i++){
-//         sum += a[i] * b[i];
-//     }
-//     return sum;
-// }
 double dot(const Vector &a, const Vector &b) {
     assert(a.size == b.size);
     double sum = 0.0;
@@ -77,31 +56,6 @@ double dot(const Vector &a, const Vector &b) {
     return sum;
 }
 
-// Vector operator*(double scalar, const Vector &v) {
-//     Vector out(v.size);
-//     for(int i = 0; i < v.size; i++){
-//         out[i] = scalar * v[i];
-//     }
-//     return out;
-// }
-
-// Vector operator+(const Vector &a, const Vector &b) {
-//     assert(a.size == b.size);
-//     Vector out(a.size);
-//     for(int i = 0; i < a.size; i++){
-//         out[i] = a[i] + b[i];
-//     }
-//     return out;
-// }
-
-// Vector operator-(const Vector &a, const Vector &b) {
-//     assert(a.size == b.size);
-//     Vector out(a.size);
-//     for(int i = 0; i < a.size; i++){
-//         out[i] = a[i] - b[i];
-//     }
-//     return out;
-// }
 Vector operator*(double scalar, const Vector &v) {
     Vector out(v.size);
     // #pragma omp parallel for schedule(static)
@@ -134,61 +88,43 @@ Vector operator-(const Vector &a, const Vector &b) {
     return out;
 }
 
-// RBF Gaussian kernel
-// double rbf_kernel(const std::vector<double> &x,
-//                   const std::vector<double> &z,
-//                   double gamma) {
-//     double sumSq = 0.0;
-//     assert(x.size() == z.size());
-//     for(int i = 0; i < (int)x.size(); i++){
-//         double diff = x[i] - z[i];
-//         sumSq += diff * diff;
-//     }
-//     return std::exp(-gamma * sumSq);
-// }
-
-// Matrix computeKernelMatrix(const std::vector<std::vector<double>> &X1,
-//                            const std::vector<std::vector<double>> &X2,
-//                            double gamma) {
-//     Matrix K(X1.size(), X2.size());
-//     for(int i = 0; i < (int)X1.size(); i++){
-//         for(int j = 0; j < (int)X2.size(); j++){
-//             K(i, j) = rbf_kernel(X1[i], X2[j], gamma);
-//         }
-//     }
-//     return K;
-// }
-
-double rbf_kernel(const std::vector<double> &x,
-                  const std::vector<double> &z,
-                  double gamma) {
+// Compute the RBF kernel between two samples represented as Vectors.
+double rbf_kernel(const Vector &x, const Vector &z, double gamma) {
+    assert(x.size == z.size);
     double sumSq = 0.0;
-    assert(x.size() == z.size());
-    // Use OpenMP SIMD reduction to vectorize the summation.
     #pragma omp simd reduction(+:sumSq)
-    for (size_t i = 0; i < x.size(); i++) {
+    for (int i = 0; i < x.size; i++) {
         double diff = x[i] - z[i];
         sumSq += diff * diff;
     }
     return std::exp(-gamma * sumSq);
 }
-Matrix computeKernelMatrix(const std::vector<std::vector<double>> &X1,
-                           const std::vector<std::vector<double>> &X2,
-                           double gamma) {
-    // Make sure there is at least one sample and one feature.
-    assert(!X1.empty() && !X2.empty());
-    size_t featureSize = X1[0].size();
-    Matrix K(X1.size(), X2.size());
-    // Parallelize over both loops.
+
+// Compute the RBF kernel matrix between rows of two matrices.
+// Each row of X1 and X2 is a sample with d features.
+Matrix computeKernelMatrix(const Matrix &X1, const Matrix &X2, double gamma) {
+    int n1 = X1.rows;
+    int n2 = X2.rows;
+    int d = X1.cols;
+    assert(X2.cols == d);
+    Matrix K(n1, n2);
+    
+    // Blocked and parallelized computation:
     #pragma omp parallel for collapse(2) schedule(dynamic)
-    for (int i = 0; i < (int)X1.size(); i++){
-        for (int j = 0; j < (int)X2.size(); j++){
-            // Here the assertion in rbf_kernel will trigger if dimensions don't match.
-            K(i, j) = rbf_kernel(X1[i], X2[j], gamma);
+    for (int i = 0; i < n1; i++){
+        for (int j = 0; j < n2; j++){
+            double sumSq = 0.0;
+            #pragma omp simd reduction(+:sumSq)
+            for (int k = 0; k < d; k++){
+                double diff = X1(i, k) - X2(j, k);
+                sumSq += diff * diff;
+            }
+            K(i, j) = std::exp(-gamma * sumSq);
         }
     }
     return K;
 }
+
 Matrix computeKernelMatrixBlocked(const Matrix &X1,
                                   const Matrix &X2,
                                   double gamma,
@@ -257,6 +193,56 @@ bool cholesky_inplace(Matrix &M) {
     return true;
 }
 
+
+bool ldlt_inplace(Matrix &M, Vector &D, double tol = 1e-8) {
+    assert(M.rows == M.cols);
+    int n = M.rows;
+    D = Vector(n);  // allocate D
+
+    for (int k = 0; k < n; k++) {
+        // Compute the pivot: D[k] = M(k,k) - sum_{j=0}^{k-1} L(k,j)^2 * D[j]
+        double sum = 0.0;
+        #pragma omp simd reduction(+:sum)
+        for (int j = 0; j < k; j++) {
+            double L_kj = M(k, j);
+            sum += L_kj * L_kj * D[j];
+        }
+        double d_val = M(k, k) - sum;
+        // Instead of failing if d_val is too small, regularize it.
+        if (d_val < tol) {
+            d_val = tol;
+        }
+        D[k] = d_val;
+        
+        // Update L(i,k) for i = k+1 to n-1:
+        #pragma omp parallel for schedule(static)
+        for (int i = k + 1; i < n; i++) {
+            double sum2 = 0.0;
+            #pragma omp simd reduction(+:sum2)
+            for (int j = 0; j < k; j++) {
+                sum2 += M(i, j) * M(k, j) * D[j];
+            }
+            M(i, k) = (M(i, k) - sum2) / d_val;
+        }
+    }
+    
+    // Set the upper-triangular part of M to zero.
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < n; r++) {
+        for (int c = r + 1; c < n; c++) {
+            M(r, c) = 0.0;
+        }
+    }
+    
+    // Set the diagonal of L to 1 (L is unit lower-triangular).
+    for (int i = 0; i < n; i++) {
+        M(i, i) = 1.0;
+    }
+    
+    return true;
+}
+
+
 // solve L * x = b, given a lower-triangular L
 Vector forward_sub(const Matrix &L, const Vector &b) {
     int n = L.rows;
@@ -284,37 +270,6 @@ Vector backward_sub(const Matrix &L, const Vector &b) {
     }
     return x;
 }
-// // solve L * x = b, given a lower-triangular L
-// Vector forward_sub(const Matrix &L, const Vector &b) {
-//     int n = L.rows;
-//     Vector x(n);
-//     for (int i = 0; i < n; i++) {
-//         double sum = b[i];
-//         // The inner loop can be vectorized since there is a reduction over k.
-//         #pragma omp simd reduction(-:sum)
-//         for (int k = 0; k < i; k++) {
-//             sum -= L(i, k) * x[k];
-//         }
-//         x[i] = sum / L(i, i);
-//     }
-//     return x;
-// }
-
-// // solve L^T * x = b, given a lower-triangular L
-// Vector backward_sub(const Matrix &L, const Vector &b) {
-//     int n = L.rows;
-//     Vector x(n);
-//     for (int i = n - 1; i >= 0; i--) {
-//         double sum = b[i];
-//         // Here too, vectorize the inner loop over k with a reduction.
-//         #pragma omp simd reduction(-:sum)
-//         for (int k = i + 1; k < n; k++) {
-//             sum -= L(k, i) * x[k]; // Note: L^T(i,k) = L(k,i)
-//         }
-//         x[i] = sum / L(i, i);
-//     }
-//     return x;
-// }
 
 typedef std::function<Vector(const Vector &)> LinOp;
 
@@ -327,8 +282,10 @@ Vector conjugateGradient(const LinOp &Aop,
     int n = b.size;
     Vector x(n), r(n), p(n);
 
-    if(x0) x = *x0;
-    else x = Vector(n);
+    if(x0)
+        x = *x0;
+    else 
+        x = Vector(n);
 
     r = b - Aop(x);
     p = r;
@@ -338,76 +295,34 @@ Vector conjugateGradient(const LinOp &Aop,
         Vector Ap = Aop(p);
         double alpha = rr_old / dot(p, Ap);
 
+        // Update x: x[j] += alpha * p[j]
+        #pragma omp parallel for schedule(static)
         for(int j = 0; j < n; j++){
             x[j] += alpha * p[j];
         }
 
+        // Update r: r[j] -= alpha * Ap[j]
+        #pragma omp parallel for schedule(static)
         for(int j = 0; j < n; j++){
             r[j] -= alpha * Ap[j];
         }
 
         double rr_new = dot(r, r);
-        if(std::sqrt(rr_new) < tol) break;
+        if(std::sqrt(rr_new) < tol)
+            break;
 
         double beta = rr_new / rr_old;
 
+        // Update p: p[j] = r[j] + beta * p[j]
+        #pragma omp parallel for schedule(static)
         for(int j = 0; j < n; j++){
             p[j] = r[j] + beta * p[j];
         }
+
         rr_old = rr_new;
     }
     return x;
 }
-// Vector conjugateGradient(const LinOp &Aop,
-//                          const Vector &b,
-//                          int maxIters,
-//                          double tol=1e-7,
-//                          const Vector *x0=nullptr)
-// {
-//     int n = b.size;
-//     Vector x(n), r(n), p(n);
-
-//     if(x0)
-//         x = *x0;
-//     else 
-//         x = Vector(n);
-
-//     r = b - Aop(x);
-//     p = r;
-//     double rr_old = dot(r, r);
-
-//     for(int i = 0; i < maxIters; i++){
-//         Vector Ap = Aop(p);
-//         double alpha = rr_old / dot(p, Ap);
-
-//         // Update x: x[j] += alpha * p[j]
-//         #pragma omp parallel for schedule(static)
-//         for(int j = 0; j < n; j++){
-//             x[j] += alpha * p[j];
-//         }
-
-//         // Update r: r[j] -= alpha * Ap[j]
-//         #pragma omp parallel for schedule(static)
-//         for(int j = 0; j < n; j++){
-//             r[j] -= alpha * Ap[j];
-//         }
-
-//         double rr_new = dot(r, r);
-//         if(std::sqrt(rr_new) < tol)
-//             break;
-
-//         double beta = rr_new / rr_old;
-
-//         // Update p: p[j] = r[j] + beta * p[j]
-//         #pragma omp parallel for schedule(static)
-//         for(int j = 0; j < n; j++){
-//             p[j] = r[j] + beta * p[j];
-//         }
-
-//         rr_old = rr_new;
-//     }
-//     return x;
-// }
 
 struct Preconditioner {
     Matrix T; // cholesky factor of Kmm
@@ -421,6 +336,7 @@ struct Preconditioner {
 // D = diag( second derivatives of loss(z[i], ym[i]))
 // Kmm <- (1/m)*T*D*T^T + lambda I
 // A = chol(Kmm)
+
 // Preconditioner weightedPreconditioner(const Matrix &Kmm,
 //                                       const Vector &ym,
 //                                       const Vector &alpha,
@@ -430,52 +346,60 @@ struct Preconditioner {
 //     int m = Kmm.rows;
 //     // 1) z = Kmm * alpha
 //     Vector z(m);
-//     for(int i = 0; i < m; i++){
+//     #pragma omp parallel for schedule(static)
+//     for (int i = 0; i < m; i++){
 //         double sum = 0.0;
-//         for(int j = 0; j < m; j++){
+//         for (int j = 0; j < m; j++){
 //             sum += Kmm(i, j) * alpha[j];
 //         }
 //         z[i] = sum;
 //     }
-//     // 2) T = chol(kmm) (copy Kmm first)
+
+//     // 2) T = chol(Kmm) (copy Kmm first)
 //     Matrix Tmat = Kmm;
-//     bool ok = cholesky_inplace(Tmat);
-//     if(!ok) std::cerr << "Cholesky failed in WeightedPreconditioner.\n";
+//     // bool ok = cholesky_inplace(Tmat);
+//     bool ok = modified_cholesky(Tmat);
+//     if (!ok) std::cerr << "Cholesky failed in WeightedPreconditioner.\n";
 
 //     // 3) Build D from second derivatives
 //     Vector diagD(m);
-//     for(int i = 0; i < m; i++){
+//     #pragma omp parallel for schedule(static)
+//     for (int i = 0; i < m; i++){
 //         diagD[i] = secondDerivLoss(z[i], ym[i]);
 //     }
 
 //     // 4) Form (1/m)*T * D * T^T
-//     Matrix M = Matrix(m, m);
-//     // M = (1/m)*(T*D*T^T)
-//     // T is lower-tri => for each col, we scale by D, then do T^T?
-//     // We will do a naive triple loop for clarity:
-//     // Let L = T, we want L * D * L^T => M
-//     for(int i = 0; i < m; i++){
-//         for(int j = 0; j < m; j++){
+//     Matrix M(m, m);
+//     // Parallelize over both i and j using collapse
+//     #pragma omp parallel for schedule(static) collapse(2)
+//     for (int i = 0; i < m; i++){
+//         for (int j = 0; j < m; j++){
 //             double sum = 0.0;
-//             for(int k = 0; k < m; k++){
-//                 // D is diagonal => D(k,k) = diagD[k]
+//             for (int k = 0; k < m; k++){
+//                 // D is diagonal: diagD[k] = D(k,k)
 //                 sum += Tmat(i, k) * diagD[k] * Tmat(j, k);
 //             }
-//             M(i, j) = (1.0/m) * sum;
+//             M(i, j) = (1.0 / m) * sum;
 //         }
 //     }
 
-//     for(int i = 0; i < m; i++){
+//     // 5) Add lambda to the diagonal of M.
+//     #pragma omp parallel for schedule(static)
+//     for (int i = 0; i < m; i++){
 //         M(i, i) += lambda;
 //     }
 
+//     // 6) Factorize M using Cholesky.
 //     Matrix Amat = M;
-//     ok = cholesky_inplace(Amat);
-//     if(!ok) std::cerr << "Cholesky failed in WeightedPreconditioner A.\n";
+//     // ok = cholesky_inplace(Amat);
+//     ok = modified_cholesky(Tmat);
+//     if (!ok) std::cerr << "Cholesky failed in WeightedPreconditioner A.\n";
 
 //     Preconditioner prec{Tmat, Amat};
 //     return prec;
 // }
+
+
 Preconditioner weightedPreconditioner(const Matrix &Kmm,
                                       const Vector &ym,
                                       const Vector &alpha,
@@ -494,27 +418,26 @@ Preconditioner weightedPreconditioner(const Matrix &Kmm,
         z[i] = sum;
     }
 
-    // 2) T = chol(Kmm) (copy Kmm first)
-    Matrix Tmat = Kmm;
-    bool ok = cholesky_inplace(Tmat);
-    if (!ok) std::cerr << "Cholesky failed in WeightedPreconditioner.\n";
+    // 2) Compute LDL^T factorization of Kmm.
+    Matrix Tmat = Kmm; // copy Kmm into Tmat
+    Vector D_factor;
+    bool ok = ldlt_inplace(Tmat, D_factor);
+    if (!ok) std::cerr << "LDL^T factorization failed in WeightedPreconditioner.\n";
 
-    // 3) Build D from second derivatives
+    // 3) Build diagD from second derivatives.
     Vector diagD(m);
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < m; i++){
         diagD[i] = secondDerivLoss(z[i], ym[i]);
     }
 
-    // 4) Form (1/m)*T * D * T^T
+    // 4) Form M = (1/m) * Tmat * diagD * Tmat^T.
     Matrix M(m, m);
-    // Parallelize over both i and j using collapse
     #pragma omp parallel for schedule(static) collapse(2)
     for (int i = 0; i < m; i++){
         for (int j = 0; j < m; j++){
             double sum = 0.0;
             for (int k = 0; k < m; k++){
-                // D is diagonal: diagD[k] = D(k,k)
                 sum += Tmat(i, k) * diagD[k] * Tmat(j, k);
             }
             M(i, j) = (1.0 / m) * sum;
@@ -527,10 +450,11 @@ Preconditioner weightedPreconditioner(const Matrix &Kmm,
         M(i, i) += lambda;
     }
 
-    // 6) Factorize M using Cholesky.
+    // 6) Factorize M using LDL^T.
     Matrix Amat = M;
-    ok = cholesky_inplace(Amat);
-    if (!ok) std::cerr << "Cholesky failed in WeightedPreconditioner A.\n";
+    Vector D_A;
+    ok = ldlt_inplace(Amat, D_A);
+    if (!ok) std::cerr << "LDL^T factorization failed in WeightedPreconditioner A.\n";
 
     Preconditioner prec{Tmat, Amat};
     return prec;
@@ -677,7 +601,6 @@ Preconditioner weightedPreconditioner(const Matrix &Kmm,
 //     return beta;
 // }
 
-
 Vector weightedFalkon(const Matrix &Kxm,
                       const Matrix &Kmm,
                       const Vector &y,
@@ -804,36 +727,6 @@ Vector weightedFalkon(const Matrix &Kxm,
     return beta;
 }
 
-// GSC-Falkon
-// Vector gscFalkon(const Matrix &Kxm,
-//                  const Matrix &Kmm,
-//                  const Vector &y,
-//                  const Vector &ym,
-//                  double lambda,
-//                  int n, int t,
-//                  double mu0, double q,
-//                  int maxNewtonIters,
-//                  std::function<double(double,double)> secondDerivLoss)
-// {
-//     int m = Kmm.rows;
-//     Vector alpha(m);
-//     for(int i = 0; i < m; i++){
-//         alpha[i] = 0.0;
-//     }
-
-//     double mu = mu0;
-//     for(int k = 0; k < maxNewtonIters; k++){
-//         alpha = weightedFalkon(Kxm, Kmm, y, ym, mu, n, t, alpha, secondDerivLoss);
-//         mu = q * mu;
-//         if(mu < lambda){
-//             break;
-//         }
-//     }
-
-//     alpha = weightedFalkon(Kxm, Kmm, y, ym, lambda, n, t , alpha, secondDerivLoss);
-
-//     return alpha;
-// }
 Vector gscFalkon(const Matrix &Kxm,
                  const Matrix &Kmm,
                  const Vector &y,
@@ -868,52 +761,6 @@ Vector gscFalkon(const Matrix &Kxm,
     return alpha;
 }
 
-// std::pair<Vector, Vector> primalandHaufeLinearWeights(const int n, 
-//                                                       const int d, 
-//                                                       const Vector &alpha, 
-//                                                       const Matrix &X) 
-// {
-//     Vector w(d);
-//     Vector p(d);
-//     Matrix Cov(d, d);
-
-//     // Compute w: for each feature j, sum over samples i.
-//     #pragma omp parallel for schedule(static)
-//     for (int j = 0; j < d; j++){
-//         double sum_j = 0.0;
-//         #pragma omp simd reduction(+:sum_j)
-//         for (int i = 0; i < n; i++){
-//             sum_j += alpha[i] * X(i, j);
-//         }
-//         w[j] = sum_j;
-//     }
-
-//     // Compute covariance: Cov(r, c) = (1/n) * sum_{i=0}^{n-1} X(i, r) * X(i, c)
-//     #pragma omp parallel for collapse(2) schedule(static)
-//     for (int r = 0; r < d; r++){
-//         for (int c = 0; c < d; c++){
-//             double sum_rc = 0.0;
-//             #pragma omp simd reduction(+:sum_rc)
-//             for (int i = 0; i < n; i++){
-//                 sum_rc += X(i, r) * X(i, c);
-//             }
-//             Cov(r, c) = sum_rc / double(n);
-//         }
-//     }
-
-//     // Compute p: for each feature r, p[r] = sum_{c=0}^{d-1} Cov(r, c) * w[c]
-//     #pragma omp parallel for schedule(static)
-//     for (int r = 0; r < d; r++){
-//         double sum_r = 0.0;
-//         #pragma omp simd reduction(+:sum_r)
-//         for (int c = 0; c < d; c++){
-//             sum_r += Cov(r, c) * w[c];
-//         }
-//         p[r] = sum_r;
-//     }
-    
-//     return {w, p};
-// }
 // Computes the weighted sum vector and the covariance matrix times that vector,
 // then returns the pair {w, p}, where:
 //   w = sum_i (alpha[i] * X(i, :))
@@ -986,8 +833,144 @@ std::pair<Vector, Vector> primalandHaufeLinearWeights(const int n,
         p[r] = sum;
     }
     
-    return {w, p};
+    std::pair<Vector, Vector> pair = std::make_pair(w,p);
+
+    return pair;
 }
+
+double logistic_second_deriv(double z, double y) {
+    double val = y * z;
+    double sig = 1.0 / (1.0 + std::exp(-val));
+    return sig * (1.0 - sig);
+}
+
+// Modified load function to read both the data and the labels into our custom types.
+bool loadGaussianData(const std::string &filename, Matrix &M, Vector &labels) {
+    std::ifstream infile(filename, std::ios::binary);
+    if (!infile) {
+        std::cerr << "Error opening file: " << filename << "\n";
+        return false;
+    }
+    
+    size_t nSamples, nFeatures;
+    infile.read(reinterpret_cast<char*>(&nSamples), sizeof(nSamples));
+    infile.read(reinterpret_cast<char*>(&nFeatures), sizeof(nFeatures));
+    
+    // Allocate the matrix with the correct dimensions.
+    M = Matrix((int)nSamples, (int)nFeatures);
+    infile.read(reinterpret_cast<char*>(M.data.data()),
+                M.data.size() * sizeof(double));
+    
+    // Allocate the labels Vector (we store labels as doubles).
+    labels = Vector((int)nSamples);
+    
+    // Read labels from file (stored as int) into a temporary vector.
+    std::vector<int> temp_labels(nSamples);
+    infile.read(reinterpret_cast<char*>(temp_labels.data()), nSamples * sizeof(int));
+    
+    infile.close();
+    
+    // Convert labels from int to double.
+    for (size_t i = 0; i < nSamples; i++){
+        labels[i] = static_cast<double>(temp_labels[i]);
+    }
+    
+    return true;
+}
+
+int main() {
+    Matrix X(0,0);
+    Vector y(0);
+    if (!loadGaussianData("gaussian_data_clusters_alt.bin", X, y)) {
+        return 1;
+    }
+    
+    int nSamples = X.rows;
+    int nFeatures = X.cols;
+    
+    std::cout << "Loaded dataset with " << nSamples 
+              << " samples and " << nFeatures << " features.\n";
+    
+    // Print first few labels from our Vector version.
+    std::cout << "First 5 labels: ";
+    for (int i = 0; i < std::min(5, nSamples); i++){
+        std::cout << y[i] << " ";
+    }
+    std::cout << std::endl;
+    
+    // Create a subset (e.g., every 5th sample)
+    int m = nSamples / 5;
+    Matrix Xm(m, nFeatures);
+    Vector ym(m);
+    for (int i = 0; i < m; i++) {
+        int idx = 5 * i;
+        for (int j = 0; j < nFeatures; j++){
+            Xm(i, j) = X(idx, j);
+        }
+        ym[i] = y[idx];
+    }
+    
+    std::cout << "Subset selected: " << m << " samples.\n";
+
+    double gamma = 0.5;
+    int blockSize = 64;
+    Matrix Kmm = computeKernelMatrixBlocked(Xm, Xm, gamma, blockSize);
+    Matrix Kxm = computeKernelMatrixBlocked(X, Xm, gamma, blockSize);
+
+    // Matrix Kmm = computeKernelMatrix(Xm, Xm, gamma);
+    // Matrix Kxm = computeKernelMatrix(X, Xm, gamma);
+
+    // for (int i = 0; i < 100; i++) {
+    //     for (int j = 0; j < 100; j++){
+    //         std::cout << Kxm(i, j)  << " ";
+    //     }
+    //     std::cout << "\n";
+    // }
+    
+    std::cout << "Kmm/Kxm solved\n";
+
+    double lambda = 5e-1;
+    double mu0 = 1e-2;
+    double q = 0.5;
+    int maxNewtonIters = 50;
+    int cgIters = 50;
+
+    int n = nSamples;
+    int d = nFeatures;  // nFeatures was loaded earlier
+    // // Vector yv = Vector(y);
+    // // Vector yvm = Vector(ym);
+    
+    auto alpha = gscFalkon(Kxm, Kmm,
+                           y, ym,
+                           lambda, n, cgIters,
+                           mu0, q, maxNewtonIters,
+                           logistic_second_deriv);
+
+    std::cout << "Final alpha:\n";
+    for(int i = 0; i < 100; i++){
+        std::cout << alpha[i] << " ";
+    }
+    std::cout << "\n\n";
+
+    std::pair<Vector, Vector> result = primalandHaufeLinearWeights(n, d, alpha, X);
+    Vector primalLinearWeights = result.first;
+    Vector haufeLinearWeights = result.second;
+
+    // std::cout << "Final primal linear weights:\n";
+    // for(int i = 0; i < m; i++){
+    //     std::cout << primalLinearWeights[i] << " ";
+    // }
+    // std::cout << "\n";
+
+    std::cout << "Final Haufe linear weights:\n";
+    for(int i = 0; i < m; i++){
+        std::cout << haufeLinearWeights[i] << " ";
+    }
+    std::cout << "\n";
+
+    return 0;
+}
+
 
 // Assume Matrix and Vector are defined as before, with Matrix storing data contiguously.
 // Not ideal
@@ -1157,113 +1140,51 @@ std::pair<Vector, Vector> primalandHaufeLinearWeights(const int n,
 //     return {w, p};
 // }
 
-double logistic_second_deriv(double z, double y) {
-    double val = y * z;
-    double sig = 1.0 / (1.0 + std::exp(-val));
-    return sig * (1.0 - sig);
-}
+// std::pair<Vector, Vector> primalandHaufeLinearWeights(const int n, 
+//                                                       const int d, 
+//                                                       const Vector &alpha, 
+//                                                       const Matrix &X) 
+// {
+//     Vector w(d);
+//     Vector p(d);
+//     Matrix Cov(d, d);
 
-bool loadGaussianData(const std::string &filename, Matrix &M) {
-    std::ifstream infile(filename, std::ios::binary);
-    if (!infile) {
-        std::cerr << "Error opening file: " << filename << "\n";
-        return false;
-    }
-    
-    size_t nSamples, nFeatures;
-    infile.read(reinterpret_cast<char*>(&nSamples), sizeof(nSamples));
-    infile.read(reinterpret_cast<char*>(&nFeatures), sizeof(nFeatures));
-    
-    // Allocate the matrix with the correct dimensions.
-    M = Matrix((int)nSamples, (int)nFeatures);
-    
-    // Read all the doubles directly into the contiguous data vector.
-    infile.read(reinterpret_cast<char*>(M.data.data()),
-                M.data.size() * sizeof(double));
-    infile.close();
-    return true;
-}
+//     // Compute w: for each feature j, sum over samples i.
+//     #pragma omp parallel for schedule(static)
+//     for (int j = 0; j < d; j++){
+//         double sum_j = 0.0;
+//         #pragma omp simd reduction(+:sum_j)
+//         for (int i = 0; i < n; i++){
+//             sum_j += alpha[i] * X(i, j);
+//         }
+//         w[j] = sum_j;
+//     }
 
-int main() {
-    Matrix X(0, 0);
-    if (!loadGaussianData("gaussian_data_alt.bin", X)) {
-        return 1;
-    }
-    
-    int nSamples = X.rows;
-    int nFeatures = X.cols;
-    
-    std::cout << "Loaded dataset with " << nSamples 
-              << " samples and " << nFeatures << " features.\n";
-    
-    // Create random dummy labels (-1 or 1) for each sample.
-    std::vector<double> y(nSamples);
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dist(0, 1);
-    for (int i = 0; i < nSamples; i++) {
-        y[i] = (dist(gen) == 0) ? -1.0 : 1.0;
-    }
-    std::cout << "Created dummy labels.\n";
-    
-    // Now, if you need to create a subset (e.g., every 5th sample), do it as follows:
-    int m = nSamples / 5;
-    Matrix Xm(m, nFeatures);
-    std::vector<double> ym(m);
-    for (int i = 0; i < m; i++) {
-        int idx = 5 * i;
-        // Copy row 'idx' from X into XmMat.
-        for (int j = 0; j < nFeatures; j++) {
-            Xm(i, j) = X(idx, j);
-        }
-        ym[i] = y[idx];
-    }
-    
-    std::cout << "Subset selected: " << m << " samples.\n";
+//     // Compute covariance: Cov(r, c) = (1/n) * sum_{i=0}^{n-1} X(i, r) * X(i, c)
+//     #pragma omp parallel for collapse(2) schedule(static)
+//     for (int r = 0; r < d; r++){
+//         for (int c = 0; c < d; c++){
+//             double sum_rc = 0.0;
+//             #pragma omp simd reduction(+:sum_rc)
+//             for (int i = 0; i < n; i++){
+//                 sum_rc += X(i, r) * X(i, c);
+//             }
+//             Cov(r, c) = sum_rc / double(n);
+//         }
+//     }
 
-    double gamma = 0.2;
-    int blockSize = 64;
-    Matrix Kmm = computeKernelMatrixBlocked(Xm, Xm, gamma, blockSize);
-    Matrix Kxm = computeKernelMatrixBlocked(X, Xm, gamma, blockSize);
+//     // Compute p: for each feature r, p[r] = sum_{c=0}^{d-1} Cov(r, c) * w[c]
+//     #pragma omp parallel for schedule(static)
+//     for (int r = 0; r < d; r++){
+//         double sum_r = 0.0;
+//         #pragma omp simd reduction(+:sum_r)
+//         for (int c = 0; c < d; c++){
+//             sum_r += Cov(r, c) * w[c];
+//         }
+//         p[r] = sum_r;
+//     }
 
-    std::cout << "Kmm/Kxm solved\n";
+//     std::pair<Vector, Vector> pair = std::make_pair(w,p);
 
-    double lambda = 5e-1;
-    double mu0 = 1e-1;
-    double q = 0.5;
-    int maxNewtonIters = 50;
-    int cgIters = 50;
-
-    int n = nSamples;
-    int d = nFeatures;  // nFeatures was loaded earlier
-    Vector yv = Vector(y);
-    Vector yvm = Vector(ym);
-    
-    auto alpha = gscFalkon(Kxm, Kmm,
-                           yv, yvm,
-                           lambda, n, cgIters,
-                           mu0, q, maxNewtonIters,
-                           logistic_second_deriv);
-
-    std::cout << "Final alpha:\n";
-    for(int i = 0; i < m; i++){
-        std::cout << alpha[i] << " ";
-    }
-    std::cout << "\n\n";
-
-    auto [primalLinearWeights, haufeLinearWeights] = primalandHaufeLinearWeights(n, d, alpha, X);
-
-    std::cout << "Final primal linear weights:\n";
-    for(int i = 0; i < m; i++){
-        std::cout << primalLinearWeights[i] << " ";
-    }
-    std::cout << "\n";
-
-    // std::cout << "Final Haufe linear weights:\n";
-    // for(int i = 0; i < m; i++){
-    //     std::cout << haufeLinearWeights[i] << " ";
-    // }
-    // std::cout << "\n";
-
-    return 0;
-}
+//     return pair;
+// }
